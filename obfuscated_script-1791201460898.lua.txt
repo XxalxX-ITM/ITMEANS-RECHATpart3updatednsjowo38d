@@ -1,8 +1,9 @@
 --[[
-    ITMEANS RECHAT - PART 3 (SIMPLE FIX)
-    - No fake checks
-    - No false "failed" messages
-    - Direct sound play like Music Pass scripts
+    ITMEANS RECHAT - PART 3 (FIXED PLAYBACK & SOUND ENGINE)
+    ✅ Sanitized Sound IDs (Removes invalid leading zeros)
+    ✅ Workspace Fallback Parent for local client audio
+    ✅ Pre-load Asset check with TimeLength validation
+    ✅ Firebase sync intact
 ]]
 
 local ITM = getgenv().ITM
@@ -26,10 +27,10 @@ local getThemeColor = ITM.getThemeColor
 local registerThemeObject = ITM.registerThemeObject
 local sendNotification = ITM.sendNotification
 
-local DarkBG = Color3.fromRGB(18, 18, 24)
 local SecondaryBG = Color3.fromRGB(28, 28, 36)
 local CurrentThemeColor = getThemeColor and getThemeColor() or Color3.fromRGB(255, 20, 147)
 
+-- ==================== CONFIG ====================
 local _FB_BASE = "https://itmeans-rechat-updated-ksn283j-default-rtdb.asia-southeast1.firebasedatabase.app"
 local CurrentServerId = (game.JobId ~= "" and game.JobId) or "StudioLocalServer"
 local FirebaseMusicURL = _FB_BASE .. "/Music_" .. CurrentServerId .. ".json"
@@ -38,13 +39,18 @@ local FirebaseChatURL = ITM.FirebaseURL
 local PASTEBIN_URL = "https://pastebin.com/raw/nxWnza4m"
 local CREATOR_USERNAME = "itmeans0011"
 
+-- ==================== STATE ====================
 local MSAccess = {}
 local songList = {}
 local songCategories = {}
 local currentCategory = "All"
 local mySound = nil
 local isDJ = false
-local currentSong = { id = "0", name = "None", lockedBy = nil, lockedByUserId = nil, lockedByDisplay = nil, startedAt = 0, duration = 0 }
+local currentSong = {
+    id = "0", name = "None",
+    lockedBy = nil, lockedByUserId = nil, lockedByDisplay = nil,
+    startedAt = 0, duration = 0
+}
 local searchQueries = {}
 
 -- ==================== HELPERS ====================
@@ -54,15 +60,18 @@ local function fmtTime(sec)
     return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
 end
 
+-- FIXED: Cleans string IDs and removes leading zeros properly
 local function normalizeSoundId(idStr)
     idStr = tostring(idStr or ""):gsub("%s+", "")
     if idStr == "" then return nil end
-    if idStr:match("^rbxassetid://") then return idStr end
-    local extracted = idStr:match("id=(%d+)")
-    if extracted then return "rbxassetid://" .. extracted end
-    if idStr:match("^%d+$") then return "rbxassetid://" .. idStr end
-    local numOnly = idStr:match("(%d+)")
-    if numOnly and #numOnly >= 5 then return "rbxassetid://" .. numOnly end
+    local cleanNum = idStr:match("(%d+)")
+    if cleanNum then
+        -- Remove non-meaningful leading zeros
+        cleanNum = cleanNum:gsub("^0+", "")
+        if #cleanNum >= 4 then
+            return "rbxassetid://" .. cleanNum
+        end
+    end
     return nil
 end
 
@@ -125,33 +134,43 @@ end
 -- ==================== SONG FETCH ====================
 local function fetchSongs()
     local ok, response = pcall(function() return game:HttpGet(PASTEBIN_URL) end)
-    if not ok or not response or response == "" then return false end
+    if not ok or not response or response == "" then
+        print("[ITM-MUSIC] ❌ Pastebin fetch failed")
+        return false
+    end
     local ok2, data = pcall(function() return HttpService:JSONDecode(response) end)
-    if not ok2 or not data then return false end
+    if not ok2 or not data then
+        print("[ITM-MUSIC] ❌ JSON decode failed")
+        return false
+    end
 
     songList = {}
     songCategories = {}
     local seen = {}
+    local rawCount = 0
 
-    for _, entry in ipairs(data) do
-        if type(entry) == "table" and entry.name and entry.id then
-            local idStr = tostring(entry.id):gsub("%s+", "")
-            if not seen[idStr] then
-                seen[idStr] = true
-                local cat = tostring(entry.category or "Other")
-                local item = {name = tostring(entry.name), id = idStr, category = cat}
-                table.insert(songList, item)
-                if not songCategories[cat] then songCategories[cat] = {} end
-                table.insert(songCategories[cat], item)
+    if type(data) == "table" then
+        for _, entry in ipairs(data) do
+            if type(entry) == "table" and entry.name and entry.id then
+                rawCount = rawCount + 1
+                local idStr = tostring(entry.id):gsub("%s+", "")
+                if not seen[idStr] then
+                    seen[idStr] = true
+                    local cat = tostring(entry.category or "Other")
+                    local item = {name = tostring(entry.name), id = idStr, category = cat}
+                    table.insert(songList, item)
+                    if not songCategories[cat] then songCategories[cat] = {} end
+                    table.insert(songCategories[cat], item)
+                end
             end
         end
     end
-    print(string.format("[ITM-MUSIC] Loaded %d songs, %d categories", #songList,
-        (function() local c = 0 for _ in pairs(songCategories) do c = c + 1 end return c end)()))
+
+    print(string.format("[ITM-MUSIC] Parsed: %d raw → %d unique songs", rawCount, #songList))
     return #songList > 0
 end
 
--- ==================== SIMPLE SOUND PLAY (LIKE MUSIC PASS) ====================
+-- ==================== MUSIC PLAYBACK ENGINE (FIXED) ====================
 local pushMusicState, updateNowPlayingUI
 
 local function stopMySound()
@@ -168,28 +187,52 @@ local function playLocalSound(songId, startOffset)
     startOffset = math.max(0, tonumber(startOffset) or 0)
 
     local normalizedId = normalizeSoundId(songId)
-    if not normalizedId then return end
+    if not normalizedId then
+        warn("[ITM-MUSIC] ❌ Invalid SoundId Format:", songId)
+        return
+    end
 
-    print("[ITM-MUSIC] ▶ Playing:", normalizedId)
+    print("[ITM-MUSIC] ▶ Attempting Playback:", normalizedId)
 
-    -- Simple play — this is what Music Pass scripts do
     local s = Instance.new("Sound")
+    s.Name = "ITM_LocalAudio"
     s.SoundId = normalizedId
     s.Volume = 3
     s.Looped = false
+    -- Parent to SoundService or Workspace depending on client environment support
     s.Parent = SoundService
-    mySound = s
-    s:Play()
 
-    -- After 3 seconds, try to seek if sync is needed (uses whatever TimeLength is available)
-    if startOffset > 0 then
-        task.delay(3, function()
-            if s and s.Parent and s.TimeLength and s.TimeLength > 0 then
-                local pos = math.min(startOffset, s.TimeLength - 1)
-                if pos > 0 then pcall(function() s.TimePosition = pos end) end
-            end
-        end)
+    mySound = s
+
+    -- Reliable Direct Playback logic
+    local played = false
+    pcall(function()
+        SoundService:PlayLocalSound(s)
+        played = true
+    end)
+
+    if not played or not s.IsPlaying then
+        s.Parent = workspace
+        pcall(function() s:Play() end)
     end
+
+    -- Handle TimePosition Sync safely after loading
+    task.spawn(function()
+        local timeout = 0
+        while s and s.Parent and not s.IsLoaded and timeout < 30 do
+            task.wait(0.1)
+            timeout = timeout + 1
+        end
+
+        if s and s.Parent and s.IsLoaded then
+            if startOffset > 0 and s.TimeLength > startOffset then
+                pcall(function() s.TimePosition = startOffset end)
+            end
+            if not s.IsPlaying then
+                pcall(function() s:Play() end)
+            end
+        end
+    end)
 
     s.Ended:Connect(function()
         if isDJ then
@@ -202,7 +245,7 @@ local function playLocalSound(songId, startOffset)
     end)
 end
 
--- ==================== FIREBASE STATE ====================
+-- ==================== FIREBASE MUSIC STATE ====================
 function pushMusicState(songId, songName, djName, djId, djDisplay, startedAt, duration)
     local payload = HttpService:JSONEncode({
         SongId = tostring(songId), SongName = songName or "None",
@@ -367,6 +410,7 @@ function renderSongList(catOverride)
     local src = (cat == "All") and songList or (songCategories[cat] or {})
     local total = #src
     local shown = 0
+
     for _, song in ipairs(src) do
         local nameLower = string.lower(song.name)
         local idLower = string.lower(song.id)
@@ -417,7 +461,7 @@ function renderSongList(catOverride)
     if shown == 0 and filter ~= "" then
         FootStatus.Text = string.format("❌ No match \"%s\" | %s: %d songs", filter, cat, total)
     else
-        FootStatus.Text = string.format("📊 %d/%d | %s", shown, total, cat)
+        FootStatus.Text = string.format("📊 %d/%d | %s | 🔍 \"%s\"", shown, total, cat, filter ~= "" and filter or "—")
     end
 end
 
@@ -493,7 +537,7 @@ function attemptPlay(song)
             local duration = tonumber(state.Duration) or 0
             local elapsed = os.time() - startedAt
             if not (duration > 0 and elapsed > duration + 3) then
-                sendSystemChat(string.format("⚡ [SYSTEM] : Already playing: %s by %s. Wait!",
+                sendSystemChat(string.format("⚡ [SYSTEM] : Already playing: %s by %s. Wait or ask DJ to stop!",
                     tostring(state.SongName), tostring(state.LockedByDisplay or state.LockedBy)))
                 return
             end
@@ -507,26 +551,25 @@ function attemptPlay(song)
     currentSong.lockedByUserId = UserId
     currentSong.lockedByDisplay = LocalPlayer.DisplayName
     currentSong.startedAt = os.time()
-    currentSong.duration = 180  -- will update if TimeLength becomes available
+    currentSong.duration = 0
     updateNowPlayingUI()
 
-    -- Push immediately
-    pushMusicState(song.id, song.name, LocalPlayer.Name, UserId, LocalPlayer.DisplayName, currentSong.startedAt, 180)
-    sendSystemChat("🎵 NOW PLAYING 🎵 | " .. song.name .. " | By: " .. LocalPlayer.DisplayName)
-
-    -- Play sound
+    pushMusicState(song.id, song.name, LocalPlayer.Name, UserId, LocalPlayer.DisplayName, currentSong.startedAt, 0)
     playLocalSound(song.id, 0)
 
-    -- Try to grab real duration after 3 sec (only for UI, not critical)
     task.delay(3, function()
-        if isDJ and mySound and mySound.TimeLength and mySound.TimeLength > 0 then
+        if not isDJ then return end
+        if mySound and mySound.TimeLength and mySound.TimeLength > 0 then
             currentSong.duration = mySound.TimeLength
             pushMusicState(song.id, song.name, LocalPlayer.Name, UserId, LocalPlayer.DisplayName, currentSong.startedAt, mySound.TimeLength)
         end
+        local durText = (currentSong.duration > 0) and fmtTime(currentSong.duration) or "--:--"
+        sendSystemChat(string.format("🎵 NOW PLAYING 🎵 | %s | By: %s | Duration: %s",
+            song.name, LocalPlayer.DisplayName, durText))
     end)
 end
 
--- ==================== STOP ====================
+-- ==================== STOP BUTTON ====================
 StopMyBtn.Activated:Connect(function()
     playSound(SOUND_TOGGLE)
     local state = currentSong
@@ -549,37 +592,54 @@ LocalPlayer.Chatted:Connect(function(msg)
     local lower = string.lower(msg or "")
 
     if string.sub(lower, 1, 4) == "!ms " then
-        if not isCreatorLocal() then return end
+        if not isCreatorLocal() then
+            sendSystemChat("⚡ [SYSTEM] : You cannot use this cmd")
+            return
+        end
         local target = string.sub(msg, 5):gsub("^%s+", ""):gsub("%s+$", "")
         if target == "" then return end
         local tp = nil
         for _, plr in ipairs(Players:GetPlayers()) do
-            if string.lower(plr.Name) == string.lower(target) or string.lower(plr.DisplayName) == string.lower(target) then tp = plr; break end
+            if string.lower(plr.Name) == string.lower(target) or string.lower(plr.DisplayName) == string.lower(target) then
+                tp = plr; break
+            end
         end
         local uname = tp and tp.Name or target
         if saveMSAccess(uname, true) then
-            sendSystemChat("⚡ [SYSTEM] : 👑 " .. uname .. " granted MS permission!")
+            sendSystemChat("⚡ [SYSTEM] : 👑 " .. uname .. " granted MS rank permission!")
+        else
+            sendSystemChat("⚡ [SYSTEM] : Failed to save MS access")
         end
         return
     end
 
     if string.sub(lower, 1, 10) == "!removems " then
-        if not isCreatorLocal() then return end
+        if not isCreatorLocal() then
+            sendSystemChat("⚡ [SYSTEM] : You cannot use this cmd")
+            return
+        end
         local target = string.sub(msg, 11):gsub("^%s+", ""):gsub("%s+$", "")
         if target == "" then return end
         local tp = nil
         for _, plr in ipairs(Players:GetPlayers()) do
-            if string.lower(plr.Name) == string.lower(target) or string.lower(plr.DisplayName) == string.lower(target) then tp = plr; break end
+            if string.lower(plr.Name) == string.lower(target) or string.lower(plr.DisplayName) == string.lower(target) then
+                tp = plr; break
+            end
         end
         local uname = tp and tp.Name or target
         if saveMSAccess(uname, false) then
-            sendSystemChat("⚡ [SYSTEM] : ❌ MS removed from " .. uname)
+            sendSystemChat("⚡ [SYSTEM] : ❌ MS rank removed from " .. uname)
+        else
+            sendSystemChat("⚡ [SYSTEM] : Failed to remove MS access")
         end
         return
     end
 
     if string.sub(lower, 1, 9) == "!stopsong" then
-        if not isCreatorLocal() then return end
+        if not isCreatorLocal() then
+            sendSystemChat("⚡ [SYSTEM] : You cannot use this cmd")
+            return
+        end
         isDJ = false
         stopMySound()
         pushMusicState("0", "None", nil, nil, nil, 0, 0)
@@ -613,8 +673,12 @@ task.spawn(function()
         end
 
         if isDJ then
-            local otherDj = state and state.LockedByUserId and state.LockedByUserId ~= UserId and sid ~= "0"
-            if otherDj then
+            local otherDjTookOver = state
+                and state.LockedByUserId
+                and state.LockedByUserId ~= UserId
+                and sid ~= "0"
+
+            if otherDjTookOver then
                 isDJ = false
                 currentSong.id = sid
                 currentSong.name = state.SongName or "None"
@@ -649,7 +713,7 @@ task.spawn(function()
     end
 end)
 
--- ==================== TIMER ====================
+-- ==================== TIMER LOOP ====================
 task.spawn(function()
     while task.wait(1) do
         if currentSong.id ~= "0" and currentSong.startedAt > 0 then
@@ -658,7 +722,7 @@ task.spawn(function()
             if dur > 0 then
                 NowTime.Text = fmtTime(math.min(elapsed, dur)) .. " / " .. fmtTime(dur)
             else
-                NowTime.Text = fmtTime(elapsed)
+                NowTime.Text = fmtTime(elapsed) .. " / --:--"
             end
         else
             NowTime.Text = ""
@@ -689,4 +753,4 @@ task.spawn(function()
     updateNowPlayingUI()
 end)
 
-print("[ITM] Part 3 loaded (simple)")
+print("[ITM] Part 3 loaded (FIXED AUDIO)")
