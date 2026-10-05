@@ -1,13 +1,12 @@
 --[[
-    ITMEANS RECHAT - PART 3 (FULL FINAL FIX)
-    ✅ Sound loads via ContentProvider + PlayLocalSound
-    ✅ Real duration (waitForDuration)
-    ✅ Category filter (explicit param)
-    ✅ Per-category search
+    ITMEANS RECHAT - PART 3 (REAL FINAL FIX)
+    ✅ Sound loads via Loaded event (proper way)
+    ✅ Direct s:Play() — no fake preload
+    ✅ Duration from real TimeLength
+    ✅ DJ not killed by polling
+    ✅ Immediate Firebase push
+    ✅ Category filter + per-category search
     ✅ Sync for late joiners
-    ✅ FIXED: DJ song not killed by polling
-    ✅ FIXED: Firebase push immediate (no 8s gap)
-    ✅ FIXED: Invalid ID handled gracefully
 ]]
 
 local ITM = getgenv().ITM
@@ -24,7 +23,6 @@ local request_func = ITM.request_func
 local playSound = ITM.playSound
 local SOUND_TOGGLE = ITM.SOUND_TOGGLE
 local Creators = ITM.Creators
-local ContentProvider = game:GetService("ContentProvider")
 
 local MusicContentFrame = ITM.MusicContentFrame
 if not MusicContentFrame then error("[ITM] Part 2 not loaded!") end
@@ -168,26 +166,16 @@ local function fetchSongs()
 
     print(string.format("[ITM-MUSIC] Parsed: %d raw → %d unique songs", rawCount, #songList))
     for cat, songs in pairs(songCategories) do
-        print(string.format("[ITM-MUSIC]   Category '%s': %d songs", cat, #songs))
+        print(string.format("[ITM-MUSIC]   '%s': %d songs", cat, #songs))
     end
     return #songList > 0
 end
 
--- ==================== MUSIC PLAYBACK ====================
-local pushMusicState, updateNowPlayingUI  -- forward declarations
-
-local function stopLocalSound()
-    if mySound then
-        pcall(function() mySound:Stop() end)
-        pcall(function() mySound:Destroy() end)
-        mySound = nil
-    end
-    isDJ = false
-    currentSyncOffset = 0
-end
+-- ==================== MUSIC PLAYBACK (REAL FIX) ====================
+local pushMusicState, updateNowPlayingUI
 
 local function playLocalSound(songId, startOffset)
-    -- Don't call stopLocalSound here when we want to preserve DJ state
+    -- Cleanup previous
     if mySound then
         pcall(function() mySound:Stop() end)
         pcall(function() mySound:Destroy() end)
@@ -199,64 +187,60 @@ local function playLocalSound(songId, startOffset)
 
     local normalizedId = normalizeSoundId(songId)
     if not normalizedId then
-        warn("[ITM-MUSIC] ❌ Invalid SoundId:", songId)
+        warn("[ITM-MUSIC] ❌ Invalid SoundId format:", songId)
         return
     end
+
     print("[ITM-MUSIC] ▶ Loading:", normalizedId, "| offset:", startOffset)
 
-    task.spawn(function()
-        local s = Instance.new("Sound")
-        s.SoundId = normalizedId
-        s.Volume = 3
-        s.Looped = false
-        s.Parent = SoundService
-        mySound = s
+    local s = Instance.new("Sound")
+    s.SoundId = normalizedId
+    s.Volume = 3
+    s.Looped = false
+    s.Parent = SoundService
+    mySound = s
 
-        -- Force preload
-        pcall(function() ContentProvider:PreloadAsync({s}) end)
+    -- ✅ FIX: Play immediately — sound will load in background
+    -- s:Play() works without preload
+    s:Play()
 
-        -- Wait for TimeLength
-        local waited = 0
-        while s and s.Parent and s.TimeLength <= 0 and waited < 8 do
-            task.wait(0.1)
-            waited = waited + 0.1
+    -- Handle Loaded event (TimeLength becomes available here)
+    s.Loaded:Connect(function()
+        print("[ITM-MUSIC] ✅ Loaded:", normalizedId, "| TimeLength:", math.floor(s.TimeLength or 0))
+        -- Set TimePosition after load if sync needed
+        if currentSyncOffset > 0 and s.TimeLength > 0 and s.Parent then
+            pcall(function()
+                s.TimePosition = math.min(currentSyncOffset, math.max(0, s.TimeLength - 1))
+            end)
         end
+    end)
 
-        if not s or not s.Parent then return end
-
-        if s.TimeLength <= 0 then
-            warn("[ITM-MUSIC] ❌ Sound failed to load:", normalizedId)
-            return
-        end
-
-        print("[ITM-MUSIC] ✅ Loaded:", normalizedId, "| TimeLength:", math.floor(s.TimeLength))
-
-        if currentSyncOffset > 0 then
-            local pos = math.min(currentSyncOffset, s.TimeLength - 1)
-            pcall(function() s.TimePosition = pos end)
-        end
-
-        pcall(function() s:Play() end)
-        task.wait(0.15)
-        if s and s.Parent and not s.IsPlaying then
-            pcall(function() SoundService:PlayLocalSound(s) end)
-        end
-
-        if s and s.IsPlaying then
-            print("[ITM-MUSIC] 🔊 Now playing:", normalizedId)
-        else
-            warn("[ITM-MUSIC] ⚠️ Playback failed:", normalizedId)
-        end
-
-        s.Ended:Connect(function()
-            if isDJ then
-                pushMusicState("0", "None", nil, nil, nil, 0, 0)
-                isDJ = false
-                updateNowPlayingUI()
+    -- Confirm playing
+    task.delay(0.3, function()
+        if s and s.Parent then
+            if s.IsPlaying then
+                print("[ITM-MUSIC] 🔊 Now playing:", normalizedId)
+            else
+                -- Retry once
+                pcall(function() s:Play() end)
+                task.wait(0.3)
+                if s and s.IsPlaying then
+                    print("[ITM-MUSIC] 🔊 Now playing (retry):", normalizedId)
+                else
+                    warn("[ITM-MUSIC] ⚠️ Sound not playing:", normalizedId)
+                end
             end
-            if s then pcall(function() s:Destroy() end) end
-            if mySound == s then mySound = nil end
-        end)
+        end
+    end)
+
+    s.Ended:Connect(function()
+        if isDJ then
+            pushMusicState("0", "None", nil, nil, nil, 0, 0)
+            isDJ = false
+            updateNowPlayingUI()
+        end
+        if s then pcall(function() s:Destroy() end) end
+        if mySound == s then mySound = nil end
     end)
 end
 
@@ -281,18 +265,6 @@ local function fetchMusicState()
     local ok2, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
     if ok2 and data then return data end
     return nil
-end
-
-local function waitForDuration(timeout)
-    timeout = timeout or 10
-    local start = tick()
-    while mySound and mySound.Parent and mySound.TimeLength <= 0 and (tick() - start) < timeout do
-        task.wait(0.1)
-    end
-    if mySound and mySound.TimeLength and mySound.TimeLength > 0 then
-        return mySound.TimeLength
-    end
-    return 0
 end
 
 -- ==================== UI BUILD ====================
@@ -437,7 +409,6 @@ function renderSongList(catOverride)
     local src = (cat == "All") and songList or (songCategories[cat] or {})
     local total = #src
     local shown = 0
-    print(string.format("[ITM-MUSIC] Rendering '%s' → %d songs", cat, total))
     for _, song in ipairs(src) do
         local nameLower = string.lower(song.name)
         local idLower = string.lower(song.id)
@@ -572,7 +543,7 @@ function attemptPlay(song)
         end
     end
 
-    -- ✅ FIX: Set DJ state FIRST so polling won't interfere
+    -- Set DJ state FIRST
     isDJ = true
     currentSong.id = song.id
     currentSong.name = song.name
@@ -583,30 +554,31 @@ function attemptPlay(song)
     currentSong.duration = 0
     updateNowPlayingUI()
 
-    -- ✅ FIX: Push to Firebase IMMEDIATELY (duration 0 = provisional)
-    -- Ye polling ko batata hai ki main DJ hu, mere sound ko mat maaro
+    -- Push to Firebase immediately (duration = 0 provisional)
     pushMusicState(song.id, song.name, LocalPlayer.Name, UserId, LocalPlayer.DisplayName, currentSong.startedAt, 0)
 
-    -- Now actually play the sound
+    -- Play sound
     playLocalSound(song.id, 0)
 
-    -- Update Firebase with real duration once loaded
+    -- Wait for TimeLength (Loaded event fires), update Firebase with real duration
     task.spawn(function()
-        local dur = waitForDuration(10)
-        if dur <= 0 or not isDJ then
-            -- Sound never loaded OR DJ state changed
-            if isDJ then
-                warn("[ITM-MUSIC] ❌ Sound never loaded, clearing")
-                pushMusicState("0", "None", nil, nil, nil, 0, 0)
-                isDJ = false
-                currentSong.id = "0"
-                currentSong.name = "None"
-                updateNowPlayingUI()
-                sendSystemChat("⚡ [SYSTEM] : ❌ Failed to load this song (audio ID invalid/deleted)")
-            end
+        local start = tick()
+        while (not mySound or mySound.TimeLength <= 0) and (tick() - start) < 10 do
+            task.wait(0.1)
+        end
+        if not isDJ then return end -- DJ state changed
+        if not mySound or mySound.TimeLength <= 0 then
+            -- Truly failed — clear
+            warn("[ITM-MUSIC] ❌ Could not load duration")
+            pushMusicState("0", "None", nil, nil, nil, 0, 0)
+            isDJ = false
+            currentSong.id = "0"
+            currentSong.name = "None"
+            updateNowPlayingUI()
+            sendSystemChat("⚡ [SYSTEM] : ❌ Song load fail (audio might be restricted/deleted). Try another.")
             return
         end
-        -- Update Firebase with real duration
+        local dur = mySound.TimeLength
         currentSong.duration = dur
         pushMusicState(song.id, song.name, LocalPlayer.Name, UserId, LocalPlayer.DisplayName, currentSong.startedAt, dur)
         local panel = string.format("🎵 NOW PLAYING 🎵 | %s | By: %s | Duration: %s",
@@ -621,8 +593,13 @@ StopMyBtn.Activated:Connect(function()
     local state = currentSong
     if not state or state.id == "0" then return end
     if isCreatorLocal() or state.lockedByUserId == UserId then
-        stopLocalSound()
+        isDJ = false
         pushMusicState("0", "None", nil, nil, nil, 0, 0)
+        if mySound then
+            pcall(function() mySound:Stop() end)
+            pcall(function() mySound:Destroy() end)
+            mySound = nil
+        end
         sendSystemChat("⚡ [SYSTEM] : 🎵 Music stopped by " .. (isCreatorLocal() and "CREATOR" or LocalPlayer.DisplayName))
         currentSong.id = "0"
         currentSong.name = "None"
@@ -676,8 +653,13 @@ LocalPlayer.Chatted:Connect(function(msg)
 
     if string.sub(lower, 1, 9) == "!stopsong" then
         if not isCreatorLocal() then sendSystemChat("⚡ [SYSTEM] : You cannot use this cmd"); return end
-        stopLocalSound()
+        isDJ = false
         pushMusicState("0", "None", nil, nil, nil, 0, 0)
+        if mySound then
+            pcall(function() mySound:Stop() end)
+            pcall(function() mySound:Destroy() end)
+            mySound = nil
+        end
         sendSystemChat("⚡ [SYSTEM] : 🎵 Music force-stopped by CREATOR")
         currentSong.id = "0"
         currentSong.name = "None"
@@ -686,7 +668,7 @@ LocalPlayer.Chatted:Connect(function(msg)
     end
 end)
 
--- ==================== FIREBASE POLLING (FIXED) ====================
+-- ==================== FIREBASE POLLING ====================
 task.spawn(function()
     while task.wait(2) do
         local state = fetchMusicState()
@@ -699,7 +681,6 @@ task.spawn(function()
             duration = tonumber(state.Duration) or 0
             elapsed = os.time() - startedAt
 
-            -- Natural end check
             if sid ~= "0" and duration > 0 and elapsed > duration + 3 then
                 if not isDJ then
                     sid = "0"
@@ -708,7 +689,6 @@ task.spawn(function()
             end
         end
 
-        -- ✅ FIX: If I'm the DJ, only surrender to ANOTHER DJ — never let Firebase kill my sound
         if isDJ then
             local otherDjTookOver = state
                 and state.LockedByUserId
@@ -716,7 +696,7 @@ task.spawn(function()
                 and sid ~= "0"
 
             if otherDjTookOver then
-                print("[ITM-MUSIC] ⚠️ Other DJ took over, surrendering")
+                print("[ITM-MUSIC] ⚠️ Other DJ took over")
                 isDJ = false
                 currentSong.id = sid
                 currentSong.name = state.SongName or "None"
@@ -728,9 +708,7 @@ task.spawn(function()
                 playLocalSound(sid, math.max(0, elapsed))
                 updateNowPlayingUI()
             end
-            -- else: keep my song alive, do NOTHING
         else
-            -- Not DJ → follow Firebase state
             if sid ~= currentSong.id then
                 currentSong.id = sid
                 currentSong.name = state and state.SongName or "None"
@@ -743,12 +721,15 @@ task.spawn(function()
                 if sid ~= "0" then
                     playLocalSound(sid, math.max(0, elapsed))
                 else
-                    stopLocalSound()
+                    if mySound then
+                        pcall(function() mySound:Stop() end)
+                        pcall(function() mySound:Destroy() end)
+                        mySound = nil
+                    end
                 end
                 updateNowPlayingUI()
             elseif sid ~= "0" and mySound == nil then
-                -- Recover: sound missing
-                print("[ITM-MUSIC] 🔄 Recovery: sound missing, restarting")
+                print("[ITM-MUSIC] 🔄 Recovery")
                 playLocalSound(sid, math.max(0, elapsed))
             end
         end
@@ -798,4 +779,4 @@ task.spawn(function()
     updateNowPlayingUI()
 end)
 
-print("[ITM] Part 3 loaded (FULL FINAL FIX)")
+print("[ITM] Part 3 loaded (REAL FINAL FIX)")
